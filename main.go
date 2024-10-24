@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -9,9 +10,13 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -28,9 +33,9 @@ var (
 	configSecretName           string        = "image-pull-secret" // default to image-pull-secret
 	configExcludedNamespaces   string        = ""
 	configServiceAccounts      string        = defaultServiceAccountName
+	portalEndpoint             string        = ""
 	configLoopDuration         time.Duration = 10 * time.Second
-
-	dockerConfigJSON string
+	dockerConfigJSON           string
 )
 
 const (
@@ -53,6 +58,7 @@ func main() {
 	flag.StringVar(&configSecretName, "secretname", LookupEnvOrString("CONFIG_SECRETNAME", configSecretName), "set name of managed secrets")
 	flag.StringVar(&configExcludedNamespaces, "excluded-namespaces", LookupEnvOrString("CONFIG_EXCLUDED_NAMESPACES", configExcludedNamespaces), "comma-separated namespaces excluded from processing")
 	flag.StringVar(&configServiceAccounts, "serviceaccounts", LookupEnvOrString("CONFIG_SERVICEACCOUNTS", configServiceAccounts), "comma-separated list of serviceaccounts to patch")
+	flag.StringVar(&portalEndpoint, "portal-endpoint", LookupEnvOrString("PORTAL_ENDPOINT", portalEndpoint), "portal endpoint to include as env variable")
 	flag.DurationVar(&configLoopDuration, "loop-duration", LookupEnvOrDuration("CONFIG_LOOP_DURATION", configLoopDuration), "String defining the loop duration")
 	flag.Parse()
 
@@ -64,7 +70,7 @@ func main() {
 
 	// Validate input, as both of these being configured would have undefined behavior.
 	if configDockerconfigjson != "" && configDockerConfigJSONPath != "" {
-		log.Panic(fmt.Errorf("Cannot specify both `configdockerjson` and `configdockerjsonpath`"))
+		log.Panic(fmt.Errorf("cannot specify both `configdockerjson` and `configdockerjsonpath`"))
 	}
 
 	// create k8s clientset from in-cluster config
@@ -80,9 +86,15 @@ func main() {
 		clientset: clientset,
 	}
 
+	// Create dynamic client
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
 	for {
 		log.Debug("Loop started")
-		loop(k8s)
+		loop(k8s, dynamicClient)
 		if configRunOnce {
 			log.Info("Exiting after single loop per `CONFIG_RUNONCE`")
 			os.Exit(0)
@@ -91,7 +103,7 @@ func main() {
 	}
 }
 
-func loop(k8s *k8sClient) {
+func loop(k8s *k8sClient, dynamicClient *dynamic.DynamicClient) {
 	var err error
 
 	// Populate secret value to set
@@ -101,7 +113,7 @@ func loop(k8s *k8sClient) {
 	}
 
 	// get all namespaces
-	namespaces, err := k8s.clientset.CoreV1().Namespaces().List(metav1.ListOptions{})
+	namespaces, err := k8s.clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		log.Panic(err)
 	}
@@ -126,6 +138,16 @@ func loop(k8s *k8sClient) {
 		if err != nil {
 			log.Error(err)
 		}
+		// get sa and add colab rolebind if not exists
+		err = processColabRolebind(k8s, namespace)
+		if err != nil {
+			log.Error(err)
+		}
+		// get sa and add colab rolebind if not exists
+		err = processPodDefault(dynamicClient, namespace)
+		if err != nil {
+			log.Error(err)
+		}
 	}
 }
 
@@ -143,9 +165,9 @@ func namespaceIsExcluded(ns corev1.Namespace) bool {
 }
 
 func processSecret(k8s *k8sClient, namespace string) error {
-	secret, err := k8s.clientset.CoreV1().Secrets(namespace).Get(configSecretName, metav1.GetOptions{})
+	secret, err := k8s.clientset.CoreV1().Secrets(namespace).Get(context.TODO(), configSecretName, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
-		_, err := k8s.clientset.CoreV1().Secrets(namespace).Create(dockerconfigSecret(namespace))
+		_, err := k8s.clientset.CoreV1().Secrets(namespace).Create(context.TODO(), dockerconfigSecret(namespace), metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("[%s] Failed to create secret: %v", namespace, err)
 		}
@@ -162,12 +184,12 @@ func processSecret(k8s *k8sClient, namespace string) error {
 		case secretWrongType, secretNoKey, secretDataNotMatch:
 			if configForce {
 				log.Warnf("[%s] Secret is not valid, overwritting now", namespace)
-				err = k8s.clientset.CoreV1().Secrets(namespace).Delete(configSecretName, &metav1.DeleteOptions{})
+				err = k8s.clientset.CoreV1().Secrets(namespace).Delete(context.TODO(), configSecretName, metav1.DeleteOptions{})
 				if err != nil {
 					return fmt.Errorf("[%s] Failed to delete secret [%s]: %v", namespace, configSecretName, err)
 				}
 				log.Warnf("[%s] Deleted secret [%s]", namespace, configSecretName)
-				_, err = k8s.clientset.CoreV1().Secrets(namespace).Create(dockerconfigSecret(namespace))
+				_, err = k8s.clientset.CoreV1().Secrets(namespace).Create(context.TODO(), dockerconfigSecret(namespace), metav1.CreateOptions{})
 				if err != nil {
 					return fmt.Errorf("[%s] Failed to create secret: %v", namespace, err)
 				}
@@ -181,7 +203,7 @@ func processSecret(k8s *k8sClient, namespace string) error {
 }
 
 func processServiceAccount(k8s *k8sClient, namespace string) error {
-	sas, err := k8s.clientset.CoreV1().ServiceAccounts(namespace).List(metav1.ListOptions{})
+	sas, err := k8s.clientset.CoreV1().ServiceAccounts(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("[%s] Failed to list service accounts: %v", namespace, err)
 	}
@@ -198,12 +220,101 @@ func processServiceAccount(k8s *k8sClient, namespace string) error {
 		if err != nil {
 			return fmt.Errorf("[%s] Failed to get patch string: %v", namespace, err)
 		}
-		_, err = k8s.clientset.CoreV1().ServiceAccounts(namespace).Patch(sa.Name, types.StrategicMergePatchType, patch)
+		_, err = k8s.clientset.CoreV1().ServiceAccounts(namespace).Patch(context.TODO(), sa.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
 		if err != nil {
 			return fmt.Errorf("[%s] Failed to patch imagePullSecrets to service account [%s]: %v", namespace, sa.Name, err)
 		}
 		log.Infof("[%s] Patched imagePullSecrets to service account [%s]", namespace, sa.Name)
 	}
+	return nil
+}
+
+func processColabRolebind(k8s *k8sClient, namespace string) error {
+	roleBindingName := fmt.Sprintf("%s-colab-bind", namespace)
+
+	// Check if the RoleBinding already exists
+	_, errGet := k8s.clientset.RbacV1().RoleBindings(namespace).Get(context.TODO(), roleBindingName, metav1.GetOptions{})
+	if errGet == nil {
+		// RoleBinding already exists, skip creation
+		fmt.Printf("RoleBinding '%s' already exists. Skipping...\n", roleBindingName)
+		return nil
+	} else if !errors.IsNotFound(errGet) {
+		// An error other than "NotFound" occurred, return the error
+		return fmt.Errorf("error checking RoleBinding: %v", errGet)
+	}
+
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      roleBindingName,
+			Namespace: namespace,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "default-editor",
+				Namespace: namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "colab-role",
+		},
+	}
+
+	// Create the RoleBinding
+	_, errCreate := k8s.clientset.RbacV1().RoleBindings(namespace).Create(context.TODO(), roleBinding, metav1.CreateOptions{})
+	if errCreate != nil {
+		return fmt.Errorf("failed to create RoleBinding: %v", errCreate)
+	}
+
+	fmt.Printf("RoleBinding created successfully for namespace: %s", namespace)
+	return nil
+}
+
+func processPodDefault(dynamicClient *dynamic.DynamicClient, namespace string) error {
+	podDefaultName := fmt.Sprintf("%s-poddefault", namespace)
+
+	// Define GroupVersionResource for PodDefault
+	podDefaultGVR := schema.GroupVersionResource{
+		Group:    "kubeflow.org",
+		Version:  "v1alpha1",
+		Resource: "poddefaults",
+	}
+
+	// Create a PodDefault resource dynamically
+	podDefault := map[string]interface{}{
+		"apiVersion": "kubeflow.org/v1alpha1",
+		"kind":       "PodDefault",
+		"metadata": map[string]interface{}{
+			"name":      podDefaultName,
+			"namespace": namespace,
+		},
+		"spec": map[string]interface{}{
+			"selector": map[string]interface{}{
+				"matchLabels": map[string]string{
+					"role": "app",
+				},
+			},
+			"desc": "Access to OctaiPipe Portal",
+			"env": []map[string]interface{}{
+				{
+					"name":  "OCTAICLIENT_ENDPOINT",
+					"value": portalEndpoint,
+				},
+			},
+		},
+	}
+
+	// Create the PodDefault in the specified namespace
+	_, err := dynamicClient.Resource(podDefaultGVR).Namespace(namespace).Create(context.TODO(), &unstructured.Unstructured{
+		Object: podDefault,
+	}, metav1.CreateOptions{})
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create PodDefault: %v", err))
+	}
+
+	fmt.Println("PodDefault created successfully.")
 	return nil
 }
 
