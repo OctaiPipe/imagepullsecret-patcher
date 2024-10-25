@@ -293,7 +293,7 @@ func processPodDefault(dynamicClient *dynamic.DynamicClient, namespace string) e
 		"spec": map[string]interface{}{
 			"selector": map[string]interface{}{
 				"matchLabels": map[string]string{
-					"role": "app",
+					"portal-access": "true",
 				},
 			},
 			"desc": "Access to OctaiPipe Portal",
