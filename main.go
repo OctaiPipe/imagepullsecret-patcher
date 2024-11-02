@@ -233,7 +233,7 @@ func processColabRolebind(k8s *k8sClient, namespace string) error {
 	roleBindingName := fmt.Sprintf("%s-colab-bind", namespace)
 
 	// Check if the RoleBinding already exists
-	_, errGet := k8s.clientset.RbacV1().RoleBindings(namespace).Get(context.TODO(), roleBindingName, metav1.GetOptions{})
+	_, errGet := k8s.clientset.RbacV1().RoleBindings("colab").Get(context.TODO(), roleBindingName, metav1.GetOptions{})
 	if errGet == nil {
 		// RoleBinding already exists, skip creation
 		fmt.Printf("RoleBinding '%s' already exists. Skipping...\n", roleBindingName)
@@ -246,7 +246,7 @@ func processColabRolebind(k8s *k8sClient, namespace string) error {
 	roleBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      roleBindingName,
-			Namespace: namespace,
+			Namespace: "colab",
 		},
 		Subjects: []rbacv1.Subject{
 			{
@@ -263,7 +263,7 @@ func processColabRolebind(k8s *k8sClient, namespace string) error {
 	}
 
 	// Create the RoleBinding
-	_, errCreate := k8s.clientset.RbacV1().RoleBindings(namespace).Create(context.TODO(), roleBinding, metav1.CreateOptions{})
+	_, errCreate := k8s.clientset.RbacV1().RoleBindings("colab").Create(context.TODO(), roleBinding, metav1.CreateOptions{})
 	if errCreate != nil {
 		return fmt.Errorf("failed to create RoleBinding: %v", errCreate)
 	}
@@ -282,39 +282,46 @@ func processPodDefault(dynamicClient *dynamic.DynamicClient, namespace string) e
 		Resource: "poddefaults",
 	}
 
-	// Create a PodDefault resource dynamically
-	podDefault := map[string]interface{}{
-		"apiVersion": "kubeflow.org/v1alpha1",
-		"kind":       "PodDefault",
-		"metadata": map[string]interface{}{
-			"name":      podDefaultName,
-			"namespace": namespace,
-		},
-		"spec": map[string]interface{}{
-			"selector": map[string]interface{}{
-				"matchLabels": map[string]string{
-					"portal-access": "true",
+	_, err := dynamicClient.Resource(podDefaultGVR).Namespace(namespace).Get(context.TODO(), podDefaultName, metav1.GetOptions{})
+	if err == nil {
+		fmt.Println("PodDefault already exists, skipping creation.")
+	} else if !errors.IsNotFound(err) {
+		// Handle other errors (e.g., API issues)
+		panic(fmt.Sprintf("Error checking PodDefault existence: %v", err))
+	} else {
+		// Create a PodDefault resource dynamically
+		podDefault := map[string]interface{}{
+			"apiVersion": "kubeflow.org/v1alpha1",
+			"kind":       "PodDefault",
+			"metadata": map[string]interface{}{
+				"name":      podDefaultName,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"selector": map[string]interface{}{
+					"matchLabels": map[string]string{
+						"portal-access": "true",
+					},
+				},
+				"desc": "Access to OctaiPipe Portal",
+				"env": []map[string]interface{}{
+					{
+						"name":  "OCTAICLIENT_ENDPOINT",
+						"value": portalEndpoint,
+					},
 				},
 			},
-			"desc": "Access to OctaiPipe Portal",
-			"env": []map[string]interface{}{
-				{
-					"name":  "OCTAICLIENT_ENDPOINT",
-					"value": portalEndpoint,
-				},
-			},
-		},
-	}
+		}
+		// Create the PodDefault in the specified namespace
+		_, err := dynamicClient.Resource(podDefaultGVR).Namespace(namespace).Create(context.TODO(), &unstructured.Unstructured{
+			Object: podDefault,
+		}, metav1.CreateOptions{})
+		if err != nil {
+			panic(fmt.Sprintf("Failed to create PodDefault: %v", err))
+		}
 
-	// Create the PodDefault in the specified namespace
-	_, err := dynamicClient.Resource(podDefaultGVR).Namespace(namespace).Create(context.TODO(), &unstructured.Unstructured{
-		Object: podDefault,
-	}, metav1.CreateOptions{})
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create PodDefault: %v", err))
+		fmt.Println("PodDefault created successfully.")
 	}
-
-	fmt.Println("PodDefault created successfully.")
 	return nil
 }
 
