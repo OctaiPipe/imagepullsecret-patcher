@@ -273,7 +273,7 @@ func processColabRolebind(k8s *k8sClient, namespace string) error {
 }
 
 func processPodDefault(dynamicClient *dynamic.DynamicClient, namespace string) error {
-	podDefaultName := fmt.Sprintf("%s-poddefault", namespace)
+	podDefaultName := "op-poddefault"
 
 	// Define GroupVersionResource for PodDefault
 	podDefaultGVR := schema.GroupVersionResource{
